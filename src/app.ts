@@ -1,18 +1,8 @@
 
-/**
- * BeadCode Studio
- * File: src/app.ts
- *
- * アイロンビーズ設計図エディタのアプリケーション本体
- * 2D専用・ブラウザ動作
- */
-
-export type BeadColor = string;
-
 export interface Bead {
   x: number;
   y: number;
-  color: BeadColor;
+  color: string;
 }
 
 export interface BoardData {
@@ -21,293 +11,534 @@ export interface BoardData {
   beads: Bead[];
 }
 
-type ToolName = "pencil" | "eraser" | "eyedropper";
+type Tool = "pencil" | "eraser" | "eyedropper";
 
-const DEFAULT_WIDTH = 16;
-const DEFAULT_HEIGHT = 16;
+interface HistoryEntry {
+  board: BoardData;
+}
 
-const COLORS = [
-  "#FFFFFF",
-  "#000000",
-  "#FF0000",
-  "#FF8C00",
-  "#FFD700",
-  "#00AA00",
-  "#00BFFF",
-  "#0000FF",
-  "#8A2BE2",
-  "#FF69B4",
-  "#A0522D",
-  "#808080",
+interface ProjectFile {
+  format: "BeadCodeStudio";
+  version: 1;
+  board: BoardData;
+  code: string;
+}
+
+const DEFAULT_WIDTH = 29;
+const DEFAULT_HEIGHT = 29;
+const CELL_SIZE = 24;
+const MAX_BOARD_SIZE = 200;
+const MAX_CODE_LENGTH = 100_000;
+
+const COLORS: Record<string, string> = {
+  RED: "#e53935",
+  BLUE: "#1e88e5",
+  GREEN: "#43a047",
+  YELLOW: "#fdd835",
+  WHITE: "#ffffff",
+  BLACK: "#212121",
+  ORANGE: "#fb8c00",
+  PINK: "#f48fb1",
+  PURPLE: "#8e24aa",
+  BROWN: "#795548",
+  GRAY: "#9e9e9e",
+  GREY: "#9e9e9e",
+  CYAN: "#00acc1",
+  LIME: "#c0ca33",
+  NAVY: "#283593",
+  GOLD: "#ffc107",
+  TRANSPARENT: "",
+};
+
+const PALETTE = [
+  "#e53935",
+  "#fb8c00",
+  "#fdd835",
+  "#c0ca33",
+  "#43a047",
+  "#00acc1",
+  "#1e88e5",
+  "#283593",
+  "#8e24aa",
+  "#f48fb1",
+  "#795548",
+  "#9e9e9e",
+  "#212121",
+  "#ffffff",
 ];
 
-const DEFAULT_CODE = `BOARD(16, 16);
+const DEFAULT_CODE = `// BeadCode Studio
+// 座標は左上が (0, 0) です。
 
-BEAD(6, 5, RED);
-BEAD(7, 5, RED);
-BEAD(8, 5, RED);
+BOARD(29, 29);
 
-BEAD(5, 6, PINK);
-BEAD(6, 6, RED);
-BEAD(7, 6, RED);
-BEAD(8, 6, RED);
-BEAD(9, 6, PINK);
+BEAD(14, 5, RED);
+BEAD(13, 6, RED);
+BEAD(14, 6, RED);
+BEAD(15, 6, RED);
 
-RUN();`;
+LINE(11, 10, 17, 10, BLUE);
+RECT(12, 11, 5, 4, YELLOW);
 
-export class BeadCodeApp {
-  private root: HTMLElement;
+RUN();
+`;
 
-  private board: BoardData = {
+function cloneBoard(board: BoardData): BoardData {
+  return {
+    width: board.width,
+    height: board.height,
+    beads: board.beads.map((bead) => ({ ...bead })),
+  };
+}
+
+function isValidDimension(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= MAX_BOARD_SIZE
+  );
+}
+
+function isValidColor(color: string): boolean {
+  return (
+    /^#[0-9a-fA-F]{6}$/.test(color) ||
+    color === ""
+  );
+}
+
+function normalizeColor(value: string): string {
+  const name = value.trim().toUpperCase();
+
+  if (Object.prototype.hasOwnProperty.call(COLORS, name)) {
+    return COLORS[name];
+  }
+
+  if (/^#[0-9a-fA-F]{6}$/.test(name)) {
+    return name.toLowerCase();
+  }
+
+  throw new Error(`不明な色です: ${value}`);
+}
+
+function validateBoard(board: BoardData): void {
+  if (
+    !isValidDimension(board.width) ||
+    !isValidDimension(board.height)
+  ) {
+    throw new Error(
+      `盤面の幅と高さは1〜${MAX_BOARD_SIZE}で指定してください。`,
+    );
+  }
+
+  const seen = new Set<string>();
+
+  for (const bead of board.beads) {
+    if (
+      !Number.isInteger(bead.x) ||
+      !Number.isInteger(bead.y) ||
+      bead.x < 0 ||
+      bead.y < 0 ||
+      bead.x >= board.width ||
+      bead.y >= board.height
+    ) {
+      throw new Error("盤面の範囲外にビーズがあります。");
+    }
+
+    if (!isValidColor(bead.color) || bead.color === "") {
+      throw new Error("ビーズの色データが不正です。");
+    }
+
+    const key = `${bead.x},${bead.y}`;
+
+    if (seen.has(key)) {
+      throw new Error("同じ座標に複数のビーズがあります。");
+    }
+
+    seen.add(key);
+  }
+}
+
+function beadKey(x: number, y: number): string {
+  return `${x},${y}`;
+}
+
+function setBead(
+  board: BoardData,
+  x: number,
+  y: number,
+  color: string,
+): void {
+  if (
+    !Number.isInteger(x) ||
+    !Number.isInteger(y) ||
+    x < 0 ||
+    y < 0 ||
+    x >= board.width ||
+    y >= board.height
+  ) {
+    throw new Error(
+      `座標 (${x}, ${y}) は盤面の範囲外です。`,
+    );
+  }
+
+  const index = board.beads.findIndex(
+    (bead) => bead.x === x && bead.y === y,
+  );
+
+  if (color === "") {
+    if (index !== -1) board.beads.splice(index, 1);
+    return;
+  }
+
+  if (index !== -1) {
+    board.beads[index].color = color;
+  } else {
+    board.beads.push({ x, y, color });
+  }
+}
+
+/**
+ * 対応コマンド:
+ * BOARD(width, height)
+ * BEAD(x, y, color)
+ * LINE(x1, y1, x2, y2, color)
+ * RECT(x, y, width, height, color)
+ * FILL(color)
+ * FILL(x, y, width, height, color)
+ * RUN()
+ */
+function executeCode(source: string): BoardData {
+  if (source.length > MAX_CODE_LENGTH) {
+    throw new Error("コードが長すぎます。");
+  }
+
+  let board: BoardData = {
     width: DEFAULT_WIDTH,
     height: DEFAULT_HEIGHT,
     beads: [],
   };
 
-  private selectedColor = "#FF0000";
-  private activeTool: ToolName = "pencil";
-  private isPointerDown = false;
-  private lastPointerCell = "";
-  private hasUnsavedChanges = false;
+  let boardWasDeclared = false;
+  const statements = source
+    .split(/\r?\n/)
+    .flatMap((line, lineIndex) => {
+      const withoutComment = line.replace(/\/\/.*$/, "").trim();
 
+      if (!withoutComment) return [];
+
+      return [{
+        text: withoutComment,
+        line: lineIndex + 1,
+      }];
+    });
+
+  for (const statement of statements) {
+    const { text, line } = statement;
+
+    try {
+      const match = text.match(
+        /^([A-Za-z_]\w*)\s*\((.*)\)\s*;?$/,
+      );
+
+      if (!match) {
+        throw new Error(
+          "コマンドの書き方が正しくありません。",
+        );
+      }
+
+      const command = match[1].toUpperCase();
+      const args = match[2]
+        .split(",")
+        .map((part) => part.trim());
+
+      const numberArg = (index: number): number => {
+        const value = args[index];
+
+        if (value === undefined || value === "") {
+          throw new Error("引数が不足しています。");
+        }
+
+        const number = Number(value);
+
+        if (!Number.isInteger(number)) {
+          throw new Error(
+            `整数が必要です: ${value}`,
+          );
+        }
+
+        return number;
+      };
+
+      const colorArg = (index: number): string => {
+        const value = args[index];
+
+        if (value === undefined || value === "") {
+          throw new Error("色の指定がありません。");
+        }
+
+        return normalizeColor(value);
+      };
+
+      const checkCount = (count: number): void => {
+        if (args.length !== count) {
+          throw new Error(
+            `引数は${count}個必要です。`,
+          );
+        }
+      };
+
+      switch (command) {
+        case "BOARD": {
+          checkCount(2);
+
+          const width = numberArg(0);
+          const height = numberArg(1);
+
+          if (
+            !isValidDimension(width) ||
+            !isValidDimension(height)
+          ) {
+            throw new Error(
+              `盤面は1〜${MAX_BOARD_SIZE}の範囲で指定してください。`,
+            );
+          }
+
+          board = {
+            width,
+            height,
+            beads: [],
+          };
+
+          boardWasDeclared = true;
+          break;
+        }
+
+        case "BEAD": {
+          checkCount(3);
+
+          if (!boardWasDeclared) {
+            // BOARDを省略した場合は初期サイズを使用します。
+            boardWasDeclared = true;
+          }
+
+          setBead(
+            board,
+            numberArg(0),
+            numberArg(1),
+            colorArg(2),
+          );
+          break;
+        }
+
+        case "LINE": {
+          checkCount(5);
+
+          const x1 = numberArg(0);
+          const y1 = numberArg(1);
+          const x2 = numberArg(2);
+          const y2 = numberArg(3);
+          const color = colorArg(4);
+
+          // Bresenham方式で直線上の座標を求めます。
+          let x = x1;
+          let y = y1;
+          const dx = Math.abs(x2 - x1);
+          const dy = Math.abs(y2 - y1);
+          const sx = x1 < x2 ? 1 : -1;
+          const sy = y1 < y2 ? 1 : -1;
+          let error = dx - dy;
+          let steps = 0;
+
+          while (true) {
+            setBead(board, x, y, color);
+
+            if (x === x2 && y === y2) break;
+
+            if (++steps > MAX_BOARD_SIZE * 2) {
+              throw new Error("直線が長すぎます。");
+            }
+
+            const doubledError = 2 * error;
+
+            if (doubledError > -dy) {
+              error -= dy;
+              x += sx;
+            }
+
+            if (doubledError < dx) {
+              error += dx;
+              y += sy;
+            }
+          }
+
+          break;
+        }
+
+        case "RECT": {
+          checkCount(5);
+
+          const x = numberArg(0);
+          const y = numberArg(1);
+          const width = numberArg(2);
+          const height = numberArg(3);
+          const color = colorArg(4);
+
+          if (width < 1 || height < 1) {
+            throw new Error(
+              "四角形の幅と高さは1以上にしてください。",
+            );
+          }
+
+          if (width * height > MAX_BOARD_SIZE ** 2) {
+            throw new Error("四角形が大きすぎます。");
+          }
+
+          for (let row = y; row < y + height; row++) {
+            for (let col = x; col < x + width; col++) {
+              setBead(board, col, row, color);
+            }
+          }
+
+          break;
+        }
+
+        case "FILL": {
+          if (args.length === 1) {
+            const color = colorArg(0);
+
+            board.beads = [];
+
+            if (color !== "") {
+              for (let y = 0; y < board.height; y++) {
+                for (let x = 0; x < board.width; x++) {
+                  board.beads.push({ x, y, color });
+                }
+              }
+            }
+          } else if (args.length === 5) {
+            const x = numberArg(0);
+            const y = numberArg(1);
+            const width = numberArg(2);
+            const height = numberArg(3);
+            const color = colorArg(4);
+
+            if (width < 1 || height < 1) {
+              throw new Error(
+                "塗りつぶしの幅と高さは1以上にしてください。",
+              );
+            }
+
+            if (width * height > MAX_BOARD_SIZE ** 2) {
+              throw new Error("塗りつぶし範囲が大きすぎます。");
+            }
+
+            for (let row = y; row < y + height; row++) {
+              for (let col = x; col < x + width; col++) {
+                setBead(board, col, row, color);
+              }
+            }
+          } else {
+            throw new Error(
+              "FILLは1個または5個の引数を指定してください。",
+            );
+          }
+
+          break;
+        }
+
+        case "RUN": {
+          checkCount(0);
+          break;
+        }
+
+        default:
+          throw new Error(
+            `未対応のコマンドです: ${command}`,
+          );
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "不明なエラーです。";
+
+      throw new Error(`${line}行目: ${message}`);
+    }
+  }
+
+  validateBoard(board);
+  return board;
+}
+
+export class BeadCodeApp {
+  private root: HTMLElement;
   private canvas!: HTMLCanvasElement;
   private ctx!: CanvasRenderingContext2D;
-  private editor!: HTMLTextAreaElement;
-  private status!: HTMLElement;
-  private statistics!: HTMLElement;
-  private colorPalette!: HTMLElement;
-  private boardSizeLabel!: HTMLElement;
-
-  private readonly cellSize = 24;
-  private readonly padding = 20;
+  private codeEditor!: HTMLTextAreaElement;
+  private statusElement!: HTMLElement;
+  private countElement!: HTMLElement;
+  private colorElement!: HTMLElement;
+  private widthInput!: HTMLInputElement;
+  private heightInput!: HTMLInputElement;
+  private fileInput!: HTMLInputElement;
+  private selectedColor = "#e53935";
+  private tool: Tool = "pencil";
+  private board: BoardData = {
+    width: DEFAULT_WIDTH,
+    height: DEFAULT_HEIGHT,
+    beads: [],
+  };
+  private history: HistoryEntry[] = [];
+  private historyIndex = -1;
+  private pointerDown = false;
+  private lastPointerKey = "";
+  private isReady = false;
 
   constructor(root: HTMLElement) {
     this.root = root;
+    this.init();
   }
 
-  /**
-   * アプリを初期化する
-   */
-  public init(): void {
+  private init(): void {
     this.renderLayout();
-    this.cacheElements();
+
+    const canvas = this.root.querySelector<HTMLCanvasElement>(
+      "#bead-canvas",
+    );
+    const editor = this.root.querySelector<HTMLTextAreaElement>(
+      "#bead-code",
+    );
+    const ctx = canvas?.getContext("2d");
+
+    if (!canvas || !editor || !ctx) {
+      throw new Error("画面の初期化に失敗しました。");
+    }
+
+    this.canvas = canvas;
+    this.codeEditor = editor;
+    this.ctx = ctx;
+
+    this.statusElement = this.mustGet("#app-status");
+    this.countElement = this.mustGet("#bead-count");
+    this.colorElement = this.mustGet("#color-counts");
+    this.widthInput = this.mustGet("#board-width");
+    this.heightInput = this.mustGet("#board-height");
+    this.fileInput = this.mustGet("#project-file");
+
     this.bindEvents();
-    this.createPalette();
-    this.loadDefaultCode();
+    this.renderPalette();
+
+    this.codeEditor.value = DEFAULT_CODE;
+    this.resizeCanvas();
+    this.pushHistory();
     this.renderBoard();
     this.updateStatistics();
     this.setStatus("準備完了");
+    this.isReady = true;
   }
 
-  /**
-   * アプリの基本レイアウト
-   */
-  private renderLayout(): void {
-    this.root.innerHTML = `
-      <main class="bead-app">
-        <header class="app-header">
-          <div class="app-brand">
-            <span class="brand-icon">◉</span>
-            <div>
-              <h1>BeadCode Studio</h1>
-              <p>アイロンビーズ設計図エディタ</p>
-            </div>
-          </div>
-
-          <div class="header-actions">
-            <button type="button" data-action="new">
-              新規作成
-            </button>
-            <button type="button" data-action="save">
-              保存
-            </button>
-            <button type="button" data-action="load">
-              読み込み
-            </button>
-            <button type="button" data-action="print">
-              印刷 / PDF
-            </button>
-          </div>
-        </header>
-
-        <section class="toolbar">
-          <button type="button" data-tool="pencil">
-            ✏️ ペン
-          </button>
-          <button type="button" data-tool="eraser">
-            ◻ 消しゴム
-          </button>
-          <button type="button" data-tool="eyedropper">
-            🎨 色取得
-          </button>
-
-          <span class="toolbar-divider"></span>
-
-          <button type="button" data-action="undo">
-            元に戻す
-          </button>
-          <button type="button" data-action="redo">
-            やり直す
-          </button>
-
-          <label class="board-size-control">
-            幅
-            <input
-              type="number"
-              id="board-width"
-              min="1"
-              max="200"
-              value="${DEFAULT_WIDTH}"
-            />
-
-            高さ
-            <input
-              type="number"
-              id="board-height"
-              min="1"
-              max="200"
-              value="${DEFAULT_HEIGHT}"
-            />
-
-            <button type="button" data-action="resize">
-              サイズ変更
-            </button>
-          </label>
-        </section>
-
-        <section class="workspace">
-          <section class="editor-panel">
-            <div class="panel-heading">
-              <h2>コードエディタ</h2>
-              <button type="button" data-action="run">
-                ▶ 実行
-              </button>
-            </div>
-
-            <textarea
-              id="bead-code"
-              spellcheck="false"
-              aria-label="BeadCodeコードエディタ"
-              placeholder="ここに設計図コードを入力してください"
-            ></textarea>
-
-            <div class="editor-footer">
-              <span>BeadCode</span>
-              <span id="code-status">未実行</span>
-            </div>
-          </section>
-
-          <section class="preview-panel">
-            <div class="panel-heading">
-              <h2>設計図プレビュー</h2>
-              <span id="board-size-label"></span>
-            </div>
-
-            <div class="board-scroll">
-              <canvas
-                id="bead-canvas"
-                aria-label="アイロンビーズ設計図"
-                role="img"
-              ></canvas>
-            </div>
-
-            <div class="board-legend">
-              <span>座標原点：左上 (0, 0)</span>
-              <span>X：右方向 / Y：下方向</span>
-            </div>
-          </section>
-
-          <aside class="settings-panel">
-            <section>
-              <h2>色パレット</h2>
-              <div id="color-palette"></div>
-              <div class="selected-color">
-                選択色：
-                <span id="selected-color-preview"></span>
-                <code id="selected-color-value"></code>
-              </div>
-
-              <label>
-                カスタムカラー
-                <input
-                  id="custom-color"
-                  type="color"
-                  value="#FF0000"
-                />
-              </label>
-            </section>
-
-            <section>
-              <h2>ビーズ集計</h2>
-              <div id="bead-statistics"></div>
-            </section>
-
-            <section>
-              <h2>操作</h2>
-              <p>
-                ペン：マスにビーズを置く
-              </p>
-              <p>
-                消しゴム：ビーズを消す
-              </p>
-              <p>
-                色取得：配置済みビーズの色を選択
-              </p>
-            </section>
-          </aside>
-        </section>
-
-        <footer class="app-footer">
-          <span id="app-status" role="status">
-            初期化中...
-          </span>
-          <span>BeadCode Studio</span>
-        </footer>
-
-        <input
-          type="file"
-          id="project-file"
-          accept=".json,application/json"
-          hidden
-        />
-      </main>
-    `;
-  }
-
-  /**
-   * DOM要素を取得する
-   */
-  private cacheElements(): void {
-    this.canvas = this.requireElement<HTMLCanvasElement>(
-      "#bead-canvas",
-    );
-
-    const context = this.canvas.getContext("2d");
-
-    if (!context) {
-      throw new Error("Canvas 2Dを初期化できません。");
-    }
-
-    this.ctx = context;
-
-    this.editor =
-      this.requireElement<HTMLTextAreaElement>("#bead-code");
-
-    this.status = this.requireElement<HTMLElement>("#app-status");
-
-    this.statistics =
-      this.requireElement<HTMLElement>("#bead-statistics");
-
-    this.colorPalette =
-      this.requireElement<HTMLElement>("#color-palette");
-
-    this.boardSizeLabel =
-      this.requireElement<HTMLElement>("#board-size-label");
-  }
-
-  private requireElement<T extends HTMLElement>(
-    selector: string,
-  ): T {
+  private mustGet<T extends HTMLElement>(selector: string): T {
     const element = this.root.querySelector<T>(selector);
 
     if (!element) {
@@ -317,455 +548,463 @@ export class BeadCodeApp {
     return element;
   }
 
-  /**
-   * イベント登録
-   */
-  private bindEvents(): void {
-    this.root.addEventListener("click", (event) => {
-      const target = event.target;
-
-      if (!(target instanceof Element)) {
-        return;
-      }
-
-      const actionButton =
-        target.closest<HTMLButtonElement>("[data-action]");
-
-      if (actionButton) {
-        this.handleAction(actionButton.dataset.action ?? "");
-        return;
-      }
-
-      const toolButton =
-        target.closest<HTMLButtonElement>("[data-tool]");
-
-      if (toolButton) {
-        const tool = toolButton.dataset.tool;
-
-        if (
-          tool === "pencil" ||
-          tool === "eraser" ||
-          tool === "eyedropper"
-        ) {
-          this.activeTool = tool;
-          this.updateToolButtons();
-          this.setStatus(`ツール変更：${tool}`);
+  private renderLayout(): void {
+    this.root.innerHTML = `
+      <style>
+        .bcs {
+          color: #202124;
+          font-family: system-ui, sans-serif;
+          max-width: 1400px;
+          margin: 0 auto;
+          padding: 16px;
         }
-      }
+        .bcs * { box-sizing: border-box; }
+        .bcs button, .bcs input, .bcs textarea { font: inherit; }
+        .bcs button {
+          padding: 7px 11px;
+          border: 1px solid #c7cbd1;
+          border-radius: 7px;
+          background: #fff;
+          color: #202124;
+          cursor: pointer;
+        }
+        .bcs button:hover { background: #edf2f7; }
+        .bcs button:focus-visible,
+        .bcs input:focus-visible,
+        .bcs textarea:focus-visible {
+          outline: 2px solid #2879df;
+          outline-offset: 2px;
+        }
+        .bcs button:disabled { opacity: .45; cursor: not-allowed; }
+        .bcs-header {
+          display: flex; flex-wrap: wrap; align-items: center;
+          justify-content: space-between; gap: 12px; margin-bottom: 16px;
+        }
+        .bcs-header h1 { font-size: 1.5rem; margin: 0; }
+        .bcs-actions, .bcs-tools, .bcs-sizes {
+          display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+        }
+        .bcs-workspace {
+          display: grid;
+          grid-template-columns: minmax(270px, 1fr) minmax(300px, 1fr);
+          gap: 16px;
+          align-items: start;
+        }
+        .bcs-panel {
+          min-width: 0; border: 1px solid #d8dce2;
+          border-radius: 10px; padding: 14px; background: #fff;
+        }
+        .bcs-panel h2 { font-size: 1.05rem; margin: 0 0 12px; }
+        .bcs-label { display: block; font-size: .9rem; margin-bottom: 5px; }
+        .bcs input[type="number"] {
+          width: 76px; padding: 7px; border: 1px solid #c7cbd1;
+          border-radius: 6px;
+        }
+        .bcs textarea {
+          width: 100%; min-height: 300px; resize: vertical;
+          padding: 12px; border: 1px solid #c7cbd1; border-radius: 8px;
+          font-family: ui-monospace, Consolas, monospace;
+          font-size: 13px; line-height: 1.55; tab-size: 2;
+        }
+        .bcs-code-actions { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+        .bcs-primary { background: #1769d2 !important; color: #fff !important; border-color: #1769d2 !important; }
+        .bcs-status { font-size: .9rem; min-height: 1.5em; overflow-wrap: anywhere; }
+        .bcs-status[data-kind="error"] { color: #c62828; }
+        .bcs-status[data-kind="success"] { color: #16803d; }
+        .bcs-canvas-wrap {
+          overflow: auto; max-height: 70vh; border: 1px solid #d8dce2;
+          border-radius: 8px; background: #f4f6f8; padding: 8px;
+        }
+        .bcs canvas { display: block; max-width: none; touch-action: none; }
+        .bcs-palette { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0; }
+        .bcs-swatch {
+          width: 30px; height: 30px; padding: 0 !important;
+          border: 2px solid #aeb4bc !important; border-radius: 50% !important;
+        }
+        .bcs-swatch[aria-pressed="true"] { outline: 3px solid #1769d2; outline-offset: 2px; }
+        .bcs-small { font-size: .85rem; color: #5f6368; }
+        .bcs-stats { margin-top: 12px; }
+        .bcs-stats ul { margin: 6px 0; padding-left: 20px; }
+        .bcs-footer { margin-top: 12px; font-size: .85rem; color: #5f6368; }
+        .bcs-tool-active { outline: 2px solid #1769d2; }
+        @media (max-width: 760px) {
+          .bcs-workspace { grid-template-columns: 1fr; }
+          .bcs { padding: 8px; }
+        }
+        @media print {
+          .bcs-header, .bcs-editor-panel, .bcs-tools,
+          .bcs-palette, .bcs-sizes, .bcs-footer { display: none !important; }
+          .bcs-workspace { display: block; }
+          .bcs-panel { border: 0; }
+          .bcs-canvas-wrap { max-height: none; overflow: visible; }
+        }
+      </style>
+
+      <div class="bcs">
+        <header class="bcs-header">
+          <h1>BeadCode Studio</h1>
+          <div class="bcs-actions">
+            <button type="button" id="new-project">新規</button>
+            <button type="button" id="save-project">保存</button>
+            <button type="button" id="load-project">読み込み</button>
+            <button type="button" id="print-project">印刷</button>
+            <input id="project-file" type="file" accept=".json,application/json" hidden>
+          </div>
+        </header>
+
+        <div class="bcs-workspace">
+          <section class="bcs-panel bcs-editor-panel">
+            <h2>コードエディタ</h2>
+            <label class="bcs-label" for="bead-code">
+              図案コード
+            </label>
+            <textarea id="bead-code" spellcheck="false"
+              aria-label="ビーズ図案のコード"></textarea>
+            <div class="bcs-code-actions">
+              <button type="button" class="bcs-primary" id="run-code">
+                ▶ 実行
+              </button>
+              <button type="button" id="clear-code">コードを消去</button>
+            </div>
+            <p class="bcs-small">
+              色は RED、BLUE、GREEN など、または #RRGGBB で指定できます。
+              座標は左上が (0, 0) です。
+            </p>
+            <div id="app-status" class="bcs-status"
+              role="status" aria-live="polite">起動中...</div>
+          </section>
+
+          <section class="bcs-panel">
+            <h2>図案プレビュー</h2>
+
+            <div class="bcs-sizes">
+              <label>
+                幅
+                <input id="board-width" type="number" min="1" max="200"
+                  value="${DEFAULT_WIDTH}">
+              </label>
+              <label>
+                高さ
+                <input id="board-height" type="number" min="1" max="200"
+                  value="${DEFAULT_HEIGHT}">
+              </label>
+              <button type="button" id="apply-size">サイズ変更</button>
+            </div>
+
+            <div class="bcs-tools" style="margin:12px 0">
+              <button type="button" data-tool="pencil" aria-pressed="true">
+                ✏️ 描く
+              </button>
+              <button type="button" data-tool="eraser" aria-pressed="false">
+                消しゴム
+              </button>
+              <button type="button" data-tool="eyedropper" aria-pressed="false">
+                色を拾う
+              </button>
+              <button type="button" id="undo" disabled>↶ 戻す</button>
+              <button type="button" id="redo" disabled>↷ やり直す</button>
+            </div>
+
+            <div class="bcs-palette" id="color-palette"
+              aria-label="色パレット"></div>
+
+            <div class="bcs-canvas-wrap">
+              <canvas id="bead-canvas"
+                aria-label="ビーズ図案。クリックまたはドラッグして編集できます。"></canvas>
+            </div>
+
+            <div class="bcs-stats">
+              <strong>ビーズ合計: <span id="bead-count">0</span> 個</strong>
+              <h3 style="font-size:.95rem">色別の個数</h3>
+              <ul id="color-counts"></ul>
+            </div>
+          </section>
+        </div>
+
+        <p class="bcs-footer">
+          BeadCode Studio · 2Dアイロンビーズ図案エディタ
+        </p>
+      </div>
+    `;
+  }
+
+  private bindEvents(): void {
+    this.mustGet("#run-code").addEventListener("click", () => {
+      this.runCode();
     });
 
-    this.colorPalette.addEventListener("click", (event) => {
-      const target = event.target;
+    this.mustGet("#clear-code").addEventListener("click", () => {
+      this.codeEditor.value = "";
+      this.setStatus("コードを消去しました。");
+    });
 
-      if (!(target instanceof HTMLElement)) {
+    this.mustGet("#new-project").addEventListener("click", () => {
+      if (
+        !window.confirm(
+          "現在の図案を破棄して新規作成しますか？",
+        )
+      ) {
         return;
       }
 
-      const button = target.closest<HTMLButtonElement>(
-        "[data-color]",
-      );
+      this.board = {
+        width: DEFAULT_WIDTH,
+        height: DEFAULT_HEIGHT,
+        beads: [],
+      };
 
-      if (button?.dataset.color) {
-        this.selectColor(button.dataset.color);
-      }
+      this.codeEditor.value = DEFAULT_CODE;
+      this.widthInput.value = String(DEFAULT_WIDTH);
+      this.heightInput.value = String(DEFAULT_HEIGHT);
+      this.pushHistory();
+      this.resizeCanvas();
+      this.renderBoard();
+      this.updateStatistics();
+      this.setStatus("新しい図案を作成しました。", "success");
     });
 
-    const customColor =
-      this.requireElement<HTMLInputElement>("#custom-color");
-
-    customColor.addEventListener("input", () => {
-      this.selectColor(customColor.value);
+    this.mustGet("#save-project").addEventListener("click", () => {
+      this.saveProject();
     });
+
+    this.mustGet("#load-project").addEventListener("click", () => {
+      this.fileInput.click();
+    });
+
+    this.fileInput.addEventListener("change", () => {
+      void this.loadProject();
+    });
+
+    this.mustGet("#print-project").addEventListener("click", () => {
+      this.printProject();
+    });
+
+    this.mustGet("#apply-size").addEventListener("click", () => {
+      this.applySize();
+    });
+
+    this.mustGet("#undo").addEventListener("click", () => {
+      this.undo();
+    });
+
+    this.mustGet("#redo").addEventListener("click", () => {
+      this.redo();
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-tool]")
+      .forEach((button) => {
+        button.addEventListener("click", () => {
+          const tool = button.dataset.tool as Tool | undefined;
+
+          if (
+            tool === "pencil" ||
+            tool === "eraser" ||
+            tool === "eyedropper"
+          ) {
+            this.setTool(tool);
+          }
+        });
+      });
 
     this.canvas.addEventListener("pointerdown", (event) => {
-      this.isPointerDown = true;
-      this.canvas.setPointerCapture(event.pointerId);
-      this.applyPointer(event);
+      this.onPointerDown(event);
     });
 
     this.canvas.addEventListener("pointermove", (event) => {
-      if (this.isPointerDown && this.activeTool === "pencil") {
-        this.applyPointer(event);
-      }
+      this.onPointerMove(event);
     });
 
     this.canvas.addEventListener("pointerup", () => {
-      this.isPointerDown = false;
-      this.lastPointerCell = "";
+      this.pointerDown = false;
+      this.lastPointerKey = "";
     });
 
     this.canvas.addEventListener("pointercancel", () => {
-      this.isPointerDown = false;
-      this.lastPointerCell = "";
+      this.pointerDown = false;
+      this.lastPointerKey = "";
     });
 
-    this.editor.addEventListener("input", () => {
-      this.hasUnsavedChanges = true;
-      this.setCodeStatus("未実行・変更あり");
+    this.canvas.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
     });
-
-    this.editor.addEventListener("keydown", (event) => {
-      if (event.key === "Tab") {
-        event.preventDefault();
-
-        const start = this.editor.selectionStart;
-        const end = this.editor.selectionEnd;
-
-        this.editor.setRangeText(
-          "  ",
-          start,
-          end,
-          "end",
-        );
-      }
-
-      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-        event.preventDefault();
-        this.runCode();
-      }
-    });
-
-    const fileInput =
-      this.requireElement<HTMLInputElement>("#project-file");
-
-    fileInput.addEventListener("change", async () => {
-      const file = fileInput.files?.[0];
-
-      if (file) {
-        await this.loadProjectFile(file);
-      }
-
-      fileInput.value = "";
-    });
-
-    this.updateToolButtons();
   }
 
-  /**
-   * ツールバーの操作
-   */
-  private handleAction(action: string): void {
-    switch (action) {
-      case "run":
-        this.runCode();
-        break;
+  private renderPalette(): void {
+    const palette = this.mustGet("#color-palette");
+    palette.replaceChildren();
 
-      case "new":
-        this.newProject();
-        break;
+    for (const color of PALETTE) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "bcs-swatch";
+      button.style.backgroundColor = color;
+      button.title = color;
+      button.setAttribute(
+        "aria-label",
+        `色を選択 ${color}`,
+      );
+      button.setAttribute(
+        "aria-pressed",
+        String(color === this.selectedColor),
+      );
 
-      case "save":
-        this.saveProject();
-        break;
+      if (color === "#ffffff") {
+        button.style.boxShadow = "inset 0 0 0 1px #ddd";
+      }
 
-      case "load":
-        this.requireElement<HTMLInputElement>(
-          "#project-file",
-        ).click();
-        break;
+      button.addEventListener("click", () => {
+        this.selectedColor = color;
+        this.setTool("pencil");
+        this.renderPalette();
+      });
 
-      case "print":
-        this.printDesign();
-        break;
-
-      case "resize":
-        this.resizeBoardFromInputs();
-        break;
-
-      case "undo":
-        this.setStatus(
-          "元に戻す機能は履歴管理モジュールとの接続後に有効になります。",
-        );
-        break;
-
-      case "redo":
-        this.setStatus(
-          "やり直し機能は履歴管理モジュールとの接続後に有効になります。",
-        );
-        break;
-
-      default:
-        this.setStatus(`不明な操作：${action}`);
+      palette.append(button);
     }
   }
 
-  /**
-   * 初期コードを設定
-   */
-  private loadDefaultCode(): void {
-    this.editor.value = DEFAULT_CODE;
+  private setTool(tool: Tool): void {
+    this.tool = tool;
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-tool]")
+      .forEach((button) => {
+        const active = button.dataset.tool === tool;
+
+        button.setAttribute("aria-pressed", String(active));
+        button.classList.toggle("bcs-tool-active", active);
+      });
   }
 
-  /**
-   * 独自コードを実行
-   *
-   * 注意：
-   * この基本版では独自言語の最小構文だけを解析する。
-   * JavaScriptのeval()は使用しない。
-   */
-  public runCode(): void {
+  private runCode(): void {
     try {
-      const result = this.parseCode(this.editor.value);
+      const nextBoard = executeCode(this.codeEditor.value);
 
-      this.board = result;
+      validateBoard(nextBoard);
+
+      this.board = nextBoard;
+      this.widthInput.value = String(this.board.width);
+      this.heightInput.value = String(this.board.height);
+
+      this.pushHistory();
+      this.resizeCanvas();
       this.renderBoard();
       this.updateStatistics();
-
-      this.hasUnsavedChanges = true;
-      this.setCodeStatus("実行成功");
-      this.setStatus("設計図を生成しました。");
+      this.setStatus("コードを実行しました。", "success");
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : String(error);
+        error instanceof Error ? error.message : "不明なエラーです。";
 
-      this.setCodeStatus("エラー");
-      this.setStatus(`コードエラー：${message}`);
+      this.setStatus(message, "error");
     }
   }
 
-  /**
-   * BeadCodeの基本パーサー
-   *
-   * 対応命令：
-   * BOARD(width, height);
-   * BEAD(x, y, COLOR);
-   * RUN();
-   */
-  private parseCode(source: string): BoardData {
-    let width = DEFAULT_WIDTH;
-    let height = DEFAULT_HEIGHT;
+  private applySize(): void {
+    const width = Number(this.widthInput.value);
+    const height = Number(this.heightInput.value);
 
-    const beads = new Map<string, Bead>();
-
-    const lines = source.split(/\r?\n/);
-
-    for (let index = 0; index < lines.length; index++) {
-      const rawLine = lines[index];
-      const line = rawLine.replace(/\/\/.*$/, "").trim();
-
-      if (!line || line.startsWith("#")) {
-        continue;
-      }
-
-      if (/^RUN\s*\(\s*\)\s*;?$/.test(line)) {
-        continue;
-      }
-
-      const boardMatch = line.match(
-        /^BOARD\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*;?$/,
+    if (
+      !isValidDimension(width) ||
+      !isValidDimension(height)
+    ) {
+      this.setStatus(
+        `幅と高さは1〜${MAX_BOARD_SIZE}の整数にしてください。`,
+        "error",
       );
-
-      if (boardMatch) {
-        width = Number(boardMatch[1]);
-        height = Number(boardMatch[2]);
-
-        this.validateBoardSize(width, height);
-        continue;
-      }
-
-      const beadMatch = line.match(
-        /^BEAD\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*([A-Z][A-Z0-9_-]*|#[0-9A-Fa-f]{6})\s*\)\s*;?$/,
-      );
-
-      if (beadMatch) {
-        const x = Number(beadMatch[1]);
-        const y = Number(beadMatch[2]);
-        const colorName = beadMatch[3];
-
-        const color = this.resolveColor(colorName);
-
-        if (x < 0 || y < 0 || x >= width || y >= height) {
-          throw new Error(
-            `${index + 1}行目：座標 (${x}, ${y}) が盤面の範囲外です。`,
-          );
-        }
-
-        beads.set(`${x},${y}`, { x, y, color });
-        continue;
-      }
-
-      throw new Error(
-        `${index + 1}行目：認識できない命令です。`,
-      );
+      return;
     }
 
-    return {
+    const nextBoard: BoardData = {
       width,
       height,
-      beads: Array.from(beads.values()),
-    };
-  }
-
-  private validateBoardSize(
-    width: number,
-    height: number,
-  ): void {
-    if (
-      !Number.isInteger(width) ||
-      !Number.isInteger(height) ||
-      width < 1 ||
-      height < 1 ||
-      width > 200 ||
-      height > 200
-    ) {
-      throw new Error(
-        "盤面の幅と高さは1～200の整数で指定してください。",
-      );
-    }
-  }
-
-  private resolveColor(name: string): string {
-    if (/^#[0-9A-Fa-f]{6}$/.test(name)) {
-      return name.toUpperCase();
-    }
-
-    const namedColors: Record<string, string> = {
-      RED: "#FF0000",
-      BLUE: "#0000FF",
-      GREEN: "#00AA00",
-      YELLOW: "#FFD700",
-      WHITE: "#FFFFFF",
-      BLACK: "#000000",
-      ORANGE: "#FF8C00",
-      PINK: "#FF69B4",
-      PURPLE: "#8A2BE2",
-      BROWN: "#A0522D",
-      GRAY: "#808080",
-      GREY: "#808080",
-      CYAN: "#00BFFF",
+      beads: this.board.beads.filter(
+        (bead) => bead.x < width && bead.y < height,
+      ),
     };
 
-    const color = namedColors[name];
-
-    if (!color) {
-      throw new Error(`未対応の色です：${name}`);
-    }
-
-    return color;
+    this.board = nextBoard;
+    this.pushHistory();
+    this.resizeCanvas();
+    this.renderBoard();
+    this.updateStatistics();
+    this.setStatus("盤面サイズを変更しました。", "success");
   }
 
-  /**
-   * Canvasの描画
-   */
+  private resizeCanvas(): void {
+    this.canvas.width = this.board.width * CELL_SIZE;
+    this.canvas.height = this.board.height * CELL_SIZE;
+    this.canvas.style.width = `${this.canvas.width}px`;
+    this.canvas.style.height = `${this.canvas.height}px`;
+  }
+
   private renderBoard(): void {
-    const { width, height, beads } = this.board;
+    const { ctx, board } = this;
 
-    const boardWidth = width * this.cellSize;
-    const boardHeight = height * this.cellSize;
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
-    const dpr = Math.max(
-      1,
-      Math.min(window.devicePixelRatio || 1, 2),
-    );
+    // 盤面の背景とグリッド
+    ctx.strokeStyle = "#d5d9df";
+    ctx.lineWidth = 1;
 
-    this.canvas.width = Math.ceil(
-      (boardWidth + this.padding * 2) * dpr,
-    );
-
-    this.canvas.height = Math.ceil(
-      (boardHeight + this.padding * 2) * dpr,
-    );
-
-    this.canvas.style.width =
-      `${boardWidth + this.padding * 2}px`;
-
-    this.canvas.style.height =
-      `${boardHeight + this.padding * 2}px`;
-
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    this.ctx.clearRect(
-      0,
-      0,
-      boardWidth + this.padding * 2,
-      boardHeight + this.padding * 2,
-    );
-
-    this.ctx.fillStyle = "#FFFFFF";
-    this.ctx.fillRect(
-      this.padding,
-      this.padding,
-      boardWidth,
-      boardHeight,
-    );
-
-    this.ctx.strokeStyle = "#D4D4D4";
-    this.ctx.lineWidth = 0.7;
-
-    for (let x = 0; x <= width; x++) {
-      const px = this.padding + x * this.cellSize;
-
-      this.ctx.beginPath();
-      this.ctx.moveTo(px, this.padding);
-      this.ctx.lineTo(px, this.padding + boardHeight);
-      this.ctx.stroke();
+    for (let x = 0; x <= board.width; x++) {
+      const px = x * CELL_SIZE + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, this.canvas.height);
+      ctx.stroke();
     }
 
-    for (let y = 0; y <= height; y++) {
-      const py = this.padding + y * this.cellSize;
-
-      this.ctx.beginPath();
-      this.ctx.moveTo(this.padding, py);
-      this.ctx.lineTo(this.padding + boardWidth, py);
-      this.ctx.stroke();
+    for (let y = 0; y <= board.height; y++) {
+      const py = y * CELL_SIZE + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0, py);
+      ctx.lineTo(this.canvas.width, py);
+      ctx.stroke();
     }
 
-    for (const bead of beads) {
-      const centerX =
-        this.padding + bead.x * this.cellSize +
-        this.cellSize / 2;
+    // ビーズの描画
+    for (const bead of board.beads) {
+      const cx = bead.x * CELL_SIZE + CELL_SIZE / 2;
+      const cy = bead.y * CELL_SIZE + CELL_SIZE / 2;
+      const radius = CELL_SIZE * 0.39;
 
-      const centerY =
-        this.padding + bead.y * this.cellSize +
-        this.cellSize / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.fillStyle = bead.color;
+      ctx.fill();
 
-      this.ctx.beginPath();
-      this.ctx.arc(
-        centerX,
-        centerY,
-        this.cellSize * 0.39,
-        0,
-        Math.PI * 2,
-      );
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
 
-      this.ctx.fillStyle = bead.color;
-      this.ctx.fill();
+      // ビーズ中央の穴
+      ctx.beginPath();
+      ctx.arc(cx, cy, CELL_SIZE * 0.12, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.fill();
 
-      this.ctx.strokeStyle = "#555555";
-      this.ctx.lineWidth = 0.6;
-      this.ctx.stroke();
-
-      this.ctx.beginPath();
-      this.ctx.arc(
-        centerX,
-        centerY,
-        this.cellSize * 0.12,
-        0,
-        Math.PI * 2,
-      );
-
-      this.ctx.fillStyle = "#FFFFFF";
-      this.ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.stroke();
     }
-
-    this.boardSizeLabel.textContent =
-      `${width} × ${height} / ${beads.length}個`;
   }
 
-  /**
-   * マウス・タッチでの編集
-   */
-  private applyPointer(event: PointerEvent): void {
+  private getCanvasCell(
+    event: PointerEvent,
+  ): { x: number; y: number } | null {
     const rect = this.canvas.getBoundingClientRect();
 
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
     const x = Math.floor(
-      (event.clientX - rect.left - this.padding) /
-      this.cellSize,
+      ((event.clientX - rect.left) / rect.width) *
+        this.canvas.width /
+        CELL_SIZE,
     );
 
     const y = Math.floor(
-      (event.clientY - rect.top - this.padding) /
-      this.cellSize,
+      ((event.clientY - rect.top) / rect.height) *
+        this.canvas.height /
+        CELL_SIZE,
     );
 
     if (
@@ -774,423 +1013,143 @@ export class BeadCodeApp {
       x >= this.board.width ||
       y >= this.board.height
     ) {
+      return null;
+    }
+
+    return { x, y };
+  }
+
+  private onPointerDown(event: PointerEvent): void {
+    if (!this.isReady && this.history.length === 0) return;
+
+    const cell = this.getCanvasCell(event);
+    if (!cell) return;
+
+    event.preventDefault();
+
+    if (this.tool === "eyedropper") {
+      const bead = this.board.beads.find(
+        (item) => item.x === cell.x && item.y === cell.y,
+      );
+
+      if (bead) {
+        this.selectedColor = bead.color;
+        this.renderPalette();
+        this.setTool("pencil");
+        this.setStatus(`色を選択しました: ${bead.color}`);
+      } else {
+        this.setStatus("この位置にはビーズがありません。");
+      }
+
       return;
     }
 
-    const key = `${x},${y}`;
+    this.pointerDown = true;
+    this.lastPointerKey = "";
+    this.canvas.setPointerCapture(event.pointerId);
+    this.paintCell(cell.x, cell.y);
+  }
 
-    if (key === this.lastPointerCell) {
-      return;
-    }
+  private onPointerMove(event: PointerEvent): void {
+    if (!this.pointerDown) return;
 
-    this.lastPointerCell = key;
+    const cell = this.getCanvasCell(event);
+    if (!cell) return;
 
-    const existing = this.board.beads.find(
+    this.paintCell(cell.x, cell.y);
+  }
+
+  private paintCell(x: number, y: number): void {
+    const key = beadKey(x, y);
+
+    if (key === this.lastPointerKey) return;
+    this.lastPointerKey = key;
+
+    const color = this.tool === "eraser" ? "" : this.selectedColor;
+    const previous = this.board.beads.find(
       (bead) => bead.x === x && bead.y === y,
     );
 
-    if (this.activeTool === "eyedropper") {
-      if (existing) {
-        this.selectColor(existing.color);
-      }
-      return;
-    }
-
-    if (this.activeTool === "eraser") {
-      this.board.beads = this.board.beads.filter(
-        (bead) => bead.x !== x || bead.y !== y,
-      );
-    } else {
-      if (existing) {
-        existing.color = this.selectedColor;
-      } else {
-        this.board.beads.push({
-          x,
-          y,
-          color: this.selectedColor,
-        });
-      }
-    }
-
-    this.hasUnsavedChanges = true;
-    this.renderBoard();
-    this.updateStatistics();
-  }
-
-  /**
-   * 色パレットを生成
-   */
-  private createPalette(): void {
-    this.colorPalette.innerHTML = "";
-
-    for (const color of COLORS) {
-      const button = document.createElement("button");
-
-      button.type = "button";
-      button.dataset.color = color;
-      button.title = color;
-      button.setAttribute("aria-label", `色 ${color}`);
-
-      button.style.backgroundColor = color;
-      button.className = "palette-color";
-
-      this.colorPalette.appendChild(button);
-    }
-
-    this.updateSelectedColorDisplay();
-  }
-
-  private selectColor(color: string): void {
-    if (!/^#[0-9A-Fa-f]{6}$/.test(color)) {
-      return;
-    }
-
-    this.selectedColor = color.toUpperCase();
-
-    this.updateSelectedColorDisplay();
-  }
-
-  private updateSelectedColorDisplay(): void {
-    const preview =
-      this.requireElement<HTMLElement>(
-        "#selected-color-preview",
-      );
-
-    const value =
-      this.requireElement<HTMLElement>(
-        "#selected-color-value",
-      );
-
-    preview.style.backgroundColor = this.selectedColor;
-    value.textContent = this.selectedColor;
-
-    this.colorPalette
-      .querySelectorAll<HTMLButtonElement>("[data-color]")
-      .forEach((button) => {
-        const selected =
-          button.dataset.color === this.selectedColor;
-
-        button.setAttribute(
-          "aria-pressed",
-          String(selected),
-        );
-
-        button.classList.toggle("selected", selected);
-      });
-  }
-
-  private updateToolButtons(): void {
-    this.root
-      .querySelectorAll<HTMLButtonElement>("[data-tool]")
-      .forEach((button) => {
-        button.classList.toggle(
-          "active",
-          button.dataset.tool === this.activeTool,
-        );
-      });
-  }
-
-  /**
-   * ビーズ数の集計
-   */
-  private updateStatistics(): void {
-    const counts = new Map<string, number>();
-
-    for (const bead of this.board.beads) {
-      counts.set(
-        bead.color,
-        (counts.get(bead.color) ?? 0) + 1,
-      );
-    }
-
-    this.statistics.replaceChildren();
-
-    const total = document.createElement("p");
-    total.textContent =
-      `合計：${this.board.beads.length}個`;
-
-    this.statistics.appendChild(total);
-
-    for (const [color, count] of counts) {
-      const row = document.createElement("div");
-      row.className = "statistics-row";
-
-      const swatch = document.createElement("span");
-      swatch.className = "statistics-swatch";
-      swatch.style.backgroundColor = color;
-
-      const label = document.createElement("span");
-      label.textContent = color;
-
-      const amount = document.createElement("strong");
-      amount.textContent = `${count}個`;
-
-      row.append(swatch, label, amount);
-      this.statistics.appendChild(row);
-    }
-  }
-
-  /**
-   * 盤面サイズを変更
-   */
-  private resizeBoardFromInputs(): void {
-    const widthInput =
-      this.requireElement<HTMLInputElement>("#board-width");
-
-    const heightInput =
-      this.requireElement<HTMLInputElement>("#board-height");
-
-    const width = Number(widthInput.value);
-    const height = Number(heightInput.value);
-
-    try {
-      this.validateBoardSize(width, height);
-
-      this.board.width = width;
-      this.board.height = height;
-
-      this.board.beads = this.board.beads.filter(
-        (bead) => bead.x < width && bead.y < height,
-      );
-
-      this.renderBoard();
-      this.updateStatistics();
-
-      this.hasUnsavedChanges = true;
-      this.setStatus("盤面サイズを変更しました。");
-    } catch (error) {
-      this.setStatus(
-        error instanceof Error
-          ? error.message
-          : String(error),
-      );
-    }
-  }
-
-  /**
-   * 新規プロジェクト
-   */
-  private newProject(): void {
     if (
-      this.hasUnsavedChanges &&
-      !window.confirm(
-        "変更が保存されていない可能性があります。新規作成しますか？",
-      )
+      (color === "" && !previous) ||
+      (color !== "" && previous?.color === color)
     ) {
       return;
     }
 
-    this.board = {
-      width: DEFAULT_WIDTH,
-      height: DEFAULT_HEIGHT,
-      beads: [],
-    };
-
-    this.editor.value = DEFAULT_CODE;
-
-    this.requireElement<HTMLInputElement>(
-      "#board-width",
-    ).value = String(DEFAULT_WIDTH);
-
-    this.requireElement<HTMLInputElement>(
-      "#board-height",
-    ).value = String(DEFAULT_HEIGHT);
-
+    setBead(this.board, x, y, color);
     this.renderBoard();
     this.updateStatistics();
-
-    this.hasUnsavedChanges = false;
-    this.setCodeStatus("未実行");
-    this.setStatus("新しい設計図を作成しました。");
+    this.setStatus(`座標 (${x}, ${y}) を編集しました。`);
   }
 
-  /**
-   * JSON形式で保存
-   */
-  private saveProject(): void {
-    const data = {
-      format: "BeadCodeStudio",
-      version: 1,
-      code: this.editor.value,
-      board: this.board,
-    };
+  private pushHistory(): void {
+    const snapshot = cloneBoard(this.board);
+    const current = this.history[this.historyIndex];
 
-    const blob = new Blob(
-      [JSON.stringify(data, null, 2)],
-      { type: "application/json" },
-    );
-
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-
-    anchor.href = url;
-    anchor.download = "design.bead.json";
-
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-
-    URL.revokeObjectURL(url);
-
-    this.hasUnsavedChanges = false;
-    this.setStatus("設計図ファイルを保存しました。");
-  }
-
-  /**
-   * JSONファイルから読み込み
-   */
-  private async loadProjectFile(file: File): Promise<void> {
-    try {
-      if (file.size > 5 * 1024 * 1024) {
-        throw new Error("ファイルサイズが大きすぎます。");
-      }
-
-      const data: unknown = JSON.parse(await file.text());
-
-      if (
-        typeof data !== "object" ||
-        data === null ||
-        !("board" in data)
-      ) {
-        throw new Error("対応していない設計図ファイルです。");
-      }
-
-      const project = data as {
-        format?: unknown;
-        code?: unknown;
-        board?: unknown;
-      };
-
-      if (project.format !== "BeadCodeStudio") {
-        throw new Error("ファイル形式が一致しません。");
-      }
-
-      if (
-        typeof project.board !== "object" ||
-        project.board === null
-      ) {
-        throw new Error("盤面データがありません。");
-      }
-
-      const board = project.board as Partial<BoardData>;
-
-      this.validateBoardSize(
-        Number(board.width),
-        Number(board.height),
-      );
-
-      if (!Array.isArray(board.beads)) {
-        throw new Error("ビーズデータが不正です。");
-      }
-
-      const beads: Bead[] = board.beads.map(
-        (item: unknown) => {
-          if (
-            typeof item !== "object" ||
-            item === null ||
-            !("x" in item) ||
-            !("y" in item) ||
-            !("color" in item)
-          ) {
-            throw new Error("ビーズデータが不正です。");
-          }
-
-          const bead = item as Bead;
-
-          if (
-            !Number.isInteger(bead.x) ||
-            !Number.isInteger(bead.y) ||
-            bead.x < 0 ||
-            bead.y < 0 ||
-            bead.x >= Number(board.width) ||
-            bead.y >= Number(board.height) ||
-            typeof bead.color !== "string" ||
-            !/^#[0-9A-Fa-f]{6}$/.test(bead.color)
-          ) {
-            throw new Error("ビーズの座標または色が不正です。");
-          }
-
-          return {
-            x: bead.x,
-            y: bead.y,
-            color: bead.color.toUpperCase(),
-          };
-        },
-      );
-
-      this.board = {
-        width: Number(board.width),
-        height: Number(board.height),
-        beads,
-      };
-
-      if (typeof project.code === "string") {
-        this.editor.value = project.code;
-      }
-
-      this.requireElement<HTMLInputElement>(
-        "#board-width",
-      ).value = String(this.board.width);
-
-      this.requireElement<HTMLInputElement>(
-        "#board-height",
-      ).value = String(this.board.height);
-
-      this.renderBoard();
-      this.updateStatistics();
-
-      this.hasUnsavedChanges = false;
-      this.setCodeStatus("読み込み済み");
-      this.setStatus("設計図を読み込みました。");
-    } catch (error) {
-      this.setStatus(
-        `読み込みエラー：${
-          error instanceof Error
-            ? error.message
-            : String(error)
-        }`,
-      );
-    }
-  }
-
-  /**
-   * 印刷
-   */
-  private printDesign(): void {
-    const printWindow = window.open(
-      "",
-      "_blank",
-      "width=900,height=700",
-    );
-
-    if (!printWindow) {
-      this.setStatus(
-        "印刷画面を開けません。ポップアップ設定を確認してください。",
-      );
+    if (
+      current &&
+      JSON.stringify(current.board) === JSON.stringify(snapshot)
+    ) {
+      this.updateHistoryButtons();
       return;
     }
 
-    const canvasImage = this.canvas.toDataURL("image/png");
+    this.history = this.history.slice(0, this.historyIndex + 1);
+    this.history.push({ board: snapshot });
 
-    const rows = Array.from(
-      { length: this.board.height },
-      (_, y) => {
-        const cells = Array.from(
-          { length: this.board.width },
-          (_, x) => {
-            const bead = this.board.beads.find(
-              (item) => item.x === x && item.y === y,
-            );
+    // 履歴が増えすぎないように上限を設定
+    if (this.history.length > 100) {
+      this.history.shift();
+    }
 
-            const color = bead?.color ?? "#FFFFFF";
+    this.historyIndex = this.history.length - 1;
+    this.updateHistoryButtons();
+  }
 
-            return `<td style="background:${color}"></td>`;
-          },
-        ).join("");
+  private undo(): void {
+    if (this.historyIndex <= 0) return;
 
-        return `<tr><th>${y}</th>${cells}</tr>`;
-      },
-    ).join("");
+    this.historyIndex--;
+    this.restoreHistory();
+    this.setStatus("ひとつ前の状態に戻しました。");
+  }
+
+  private redo(): void {
+    if (this.historyIndex >= this.history.length - 1) return;
+
+    this.historyIndex++;
+    this.restoreHistory();
+    this.setStatus("操作をやり直しました。");
+  }
+
+  private restoreHistory(): void {
+    const entry = this.history[this.historyIndex];
+    if (!entry) return;
+
+    this.board = cloneBoard(entry.board);
+    this.widthInput.value = String(this.board.width);
+    this.heightInput.value = String(this.board.height);
+
+    this.resizeCanvas();
+    this.renderBoard();
+    this.updateStatistics();
+    this.updateHistoryButtons();
+  }
+
+  private updateHistoryButtons(): void {
+    const undo = this.root.querySelector<HTMLButtonElement>("#undo");
+    const redo = this.root.querySelector<HTMLButtonElement>("#redo");
+
+    if (undo) undo.disabled = this.historyIndex <= 0;
+    if (redo) {
+      redo.disabled =
+        this.historyIndex >= this.history.length - 1;
+    }
+  }
+
+  private updateStatistics(): void {
+    this.countElement.textContent = String(this.board.beads.length);
 
     const counts = new Map<string, number>();
 
@@ -1201,121 +1160,223 @@ export class BeadCodeApp {
       );
     }
 
-    const statistics = Array.from(counts.entries())
-      .map(([color, count]) =>
-        `<li><span style="display:inline-block;width:12px;height:12px;background:${color};border:1px solid #777"></span> ${color}: ${count}個</li>`,
-      )
+    this.colorElement.replaceChildren();
+
+    const sorted = [...counts.entries()].sort(
+      (a, b) => b[1] - a[1],
+    );
+
+    if (sorted.length === 0) {
+      const item = document.createElement("li");
+      item.textContent = "まだビーズがありません。";
+      this.colorElement.append(item);
+      return;
+    }
+
+    for (const [color, count] of sorted) {
+      const item = document.createElement("li");
+      const swatch = document.createElement("span");
+
+      swatch.style.display = "inline-block";
+      swatch.style.width = "12px";
+      swatch.style.height = "12px";
+      swatch.style.marginRight = "6px";
+      swatch.style.border = "1px solid #999";
+      swatch.style.backgroundColor = color;
+
+      item.append(swatch);
+      item.append(
+        document.createTextNode(`${color}: ${count}個`),
+      );
+
+      this.colorElement.append(item);
+    }
+  }
+
+  private saveProject(): void {
+    const project: ProjectFile = {
+      format: "BeadCodeStudio",
+      version: 1,
+      board: cloneBoard(this.board),
+      code: this.codeEditor.value,
+    };
+
+    const blob = new Blob(
+      [JSON.stringify(project, null, 2)],
+      { type: "application/json;charset=utf-8" },
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = "bead-project.json";
+    link.click();
+
+    URL.revokeObjectURL(url);
+    this.setStatus("図案をJSONファイルに保存しました。", "success");
+  }
+
+  private async loadProject(): Promise<void> {
+    const file = this.fileInput.files?.[0];
+
+    if (!file) return;
+
+    try {
+      if (file.size > 10 * 1024 * 1024) {
+        throw new Error("ファイルが大きすぎます（上限10MB）。");
+      }
+
+      const text = await file.text();
+      const parsed: unknown = JSON.parse(text);
+
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        !("format" in parsed) ||
+        !("version" in parsed) ||
+        !("board" in parsed) ||
+        !("code" in parsed)
+      ) {
+        throw new Error("プロジェクトファイルの形式が違います。");
+      }
+
+      const project = parsed as ProjectFile;
+
+      if (
+        project.format !== "BeadCodeStudio" ||
+        project.version !== 1
+      ) {
+        throw new Error("未対応のプロジェクト形式です。");
+      }
+
+      if (
+        typeof project.code !== "string" ||
+        project.code.length > MAX_CODE_LENGTH
+      ) {
+        throw new Error("コードデータが不正です。");
+      }
+
+      const rawBoard = project.board as BoardData;
+
+      if (
+        !rawBoard ||
+        !Array.isArray(rawBoard.beads) ||
+        rawBoard.beads.length > MAX_BOARD_SIZE ** 2
+      ) {
+        throw new Error("盤面データが不正です。");
+      }
+
+      const nextBoard: BoardData = {
+        width: rawBoard.width,
+        height: rawBoard.height,
+        beads: rawBoard.beads.map((bead) => ({
+          x: bead.x,
+          y: bead.y,
+          color: bead.color,
+        })),
+      };
+
+      validateBoard(nextBoard);
+
+      this.board = nextBoard;
+      this.codeEditor.value = project.code;
+      this.widthInput.value = String(nextBoard.width);
+      this.heightInput.value = String(nextBoard.height);
+
+      this.pushHistory();
+      this.resizeCanvas();
+      this.renderBoard();
+      this.updateStatistics();
+      this.setStatus("図案を読み込みました。", "success");
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "読み込みに失敗しました。";
+
+      this.setStatus(message, "error");
+    } finally {
+      this.fileInput.value = "";
+    }
+  }
+
+  private printProject(): void {
+    const printWindow = window.open("", "_blank");
+
+    if (!printWindow) {
+      this.setStatus(
+        "印刷画面を開けません。ポップアップを許可してください。",
+        "error",
+      );
+      return;
+    }
+
+    const image = this.canvas.toDataURL("image/png");
+
+    const counts = new Map<string, number>();
+
+    for (const bead of this.board.beads) {
+      counts.set(
+        bead.color,
+        (counts.get(bead.color) ?? 0) + 1,
+      );
+    }
+
+    const rows = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([color, count]) => {
+        return `<tr>
+          <td><span class="swatch" style="background:${color}"></span>${color}</td>
+          <td>${count}</td>
+        </tr>`;
+      })
       .join("");
 
-    printWindow.document.write(`
-      <!DOCTYPE html>
+    const doc = printWindow.document;
+    doc.open();
+    doc.write(`<!doctype html>
       <html lang="ja">
       <head>
-        <meta charset="UTF-8">
+        <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>アイロンビーズ設計図</title>
+        <title>BeadCode Studio - 印刷</title>
         <style>
-          @page { size: A4; margin: 12mm; }
-          body {
-            font-family: sans-serif;
-            color: #222;
-          }
+          body { font-family: sans-serif; margin: 16mm; color: #222; }
           h1 { font-size: 20px; }
-          .preview {
-            max-width: 100%;
-            max-height: 100mm;
-            object-fit: contain;
-          }
-          table {
-            border-collapse: collapse;
-            margin-top: 12px;
-          }
-          th, td {
-            border: 0.5px solid #777;
-            width: 7mm;
-            height: 7mm;
-            text-align: center;
-            padding: 0;
-          }
-          th {
-            background: #eee;
-            font-size: 8pt;
-          }
-          td {
-            print-color-adjust: exact;
-            -webkit-print-color-adjust: exact;
-          }
-          ul {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            padding: 0;
-            list-style: none;
-          }
-          li { font-size: 10pt; }
-          @media print {
-            button { display: none; }
-          }
+          .info { margin-bottom: 16px; }
+          img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; }
+          table { border-collapse: collapse; margin-top: 16px; }
+          th, td { border: 1px solid #888; padding: 6px 12px; text-align: left; }
+          .swatch { display:inline-block; width:12px; height:12px; border:1px solid #777; margin-right:6px; }
+          @media print { body { margin: 8mm; } img { max-height: 210mm; object-fit: contain; } }
         </style>
       </head>
       <body>
-        <h1>アイロンビーズ設計図</h1>
-        <p>
-          サイズ：${this.board.width} × ${this.board.height}
-          ／ 合計 ${this.board.beads.length} 個
-        </p>
-
-        <img class="preview" src="${canvasImage}" alt="設計図">
-
-        <h2>色別ビーズ数</h2>
-        <ul>${statistics}</ul>
-
-        <h2>座標付き設計図</h2>
+        <h1>BeadCode Studio 図案</h1>
+        <p class="info">盤面サイズ: ${this.board.width} × ${this.board.height}
+          ／ ビーズ合計: ${this.board.beads.length}個</p>
+        <img src="${image}" alt="アイロンビーズ図案">
+        <h2>色別の個数</h2>
         <table>
-          <thead>
-            <tr>
-              <th>Y\\X</th>
-              ${Array.from(
-                { length: this.board.width },
-                (_, x) => `<th>${x}</th>`,
-              ).join("")}
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
+          <thead><tr><th>色</th><th>個数</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="2">ビーズなし</td></tr>'}</tbody>
         </table>
-
-        <p>
-          座標原点：(0, 0) ／ Xは右方向、Yは下方向
-        </p>
-
-        <button onclick="window.print()">印刷 / PDF保存</button>
+        <script>window.onload = () => window.print();<\/script>
       </body>
-      </html>
-    `);
+      </html>`);
+    doc.close();
 
-    printWindow.document.close();
-
-    this.setStatus("印刷用の設計図を作成しました。");
+    this.setStatus("印刷画面を開きました。", "success");
   }
 
-  private setStatus(message: string): void {
-    this.status.textContent = message;
-  }
-
-  private setCodeStatus(message: string): void {
-    this.requireElement<HTMLElement>(
-      "#code-status",
-    ).textContent = message;
+  private setStatus(
+    message: string,
+    kind: "normal" | "success" | "error" = "normal",
+  ): void {
+    this.statusElement.textContent = message;
+    this.statusElement.dataset.kind = kind;
   }
 }
 
-/**
- * 外部から呼び出す初期化関数
- */
-export function createApp(
-  root: HTMLElement = document.body,
-): BeadCodeApp {
-  const app = new BeadCodeApp(root);
-  app.init();
-  return app;
+export function createApp(root: HTMLElement): BeadCodeApp {
+  return new BeadCodeApp(root);
 }
